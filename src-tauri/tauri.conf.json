@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "密阁",
   "version": "1.0.0",
-  "identifier": "org.liqihai.app.mige.win",
+  "identifier": "org.liqihai.app.mige",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:5173",
@@ -12,6 +12,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "密阁",
         "width": 1120,
         "height": 780,
@@ -30,8 +31,26 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "icon": [],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "Utility",
     "shortDescription": "本地加密密码与验证码管理器",
-    "longDescription": "密阁：本地加密保存账号密码与两步验证码，支持密码生成、导入导出，与鸿蒙版数据格式互通。"
+    "longDescription": "密阁：本地加密保存账号密码与两步验证码，支持密码生成、导入导出与 Vaultwarden 同步，与鸿蒙版数据格式互通。",
+    "windows": {
+      "wix": {
+        "language": ["zh-CN"]
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    },
+    "android": {
+      "minSdkVersion": 24
+    }
   }
 }

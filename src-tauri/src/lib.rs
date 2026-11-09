@@ -261,7 +261,7 @@ fn read_text_file(path: String) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| format!("READ_FAILED: {e}"))
 }
 
-/// 用系统默认浏览器打开网址（Windows）
+/// 用系统默认浏览器打开网址（Windows / macOS / Linux 分别调用对应命令）
 #[tauri::command]
 fn open_url(url: String) -> Result<(), String> {
     let target = if url.starts_with("http://") || url.starts_with("https://") {
@@ -269,11 +269,23 @@ fn open_url(url: String) -> Result<(), String> {
     } else {
         format!("https://{url}")
     };
-    std::process::Command::new("cmd")
+
+    #[cfg(target_os = "windows")]
+    let launch = std::process::Command::new("cmd")
         .args(["/C", "start", "", &target])
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("OPEN_URL_FAILED: {e}"))
+        .spawn();
+
+    #[cfg(target_os = "macos")]
+    let launch = std::process::Command::new("open").arg(&target).spawn();
+
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+    let launch = std::process::Command::new("xdg-open").arg(&target).spawn();
+
+    #[cfg(target_os = "android")]
+    let launch: Result<std::process::Child, std::io::Error> =
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "Android 需用 Intent 打开链接"));
+
+    launch.map(|_| ()).map_err(|e| format!("OPEN_URL_FAILED: {e}"))
 }
 
 // ---------- Vaultwarden / Bitwarden 同步 ----------
