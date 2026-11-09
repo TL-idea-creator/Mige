@@ -1,0 +1,46 @@
+[package]
+name = "mige-win"
+version = "1.0.0"
+description = "密阁 Windows 版：本地加密密码与验证码管理器"
+authors = ["李启海 <liqihai1987@foxmail.com>"]
+edition = "2021"
+
+[lib]
+name = "mige_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 与鸿蒙版一致的国密算法：SM4-128-CBC + HMAC-SM3
+sm4 = "0.5"
+sm3 = "0.4"
+cbc = { version = "0.1", features = ["alloc"] }
+# KDF 与 HMAC
+pbkdf2 = { version = "0.12", features = ["hmac"] }
+hmac = "0.12"
+sha2 = "0.10"
+sha1 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+uuid = { version = "1", features = ["v4"] }
+# Vaultwarden/Bitwarden 同步：AES-256-CBC + HMAC-SHA256 + HKDF + HTTP
+aes = "0.8"
+hkdf = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

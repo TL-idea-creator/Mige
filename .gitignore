@@ -1,0 +1,10 @@
+# 依赖与构建产物
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# 本地产物
+*.log
+.DS_Store
+Thumbs.db

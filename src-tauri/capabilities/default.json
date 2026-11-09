@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "密阁默认能力：窗口基础能力 + 文件选择对话框（导入导出）",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:default"]
+}
