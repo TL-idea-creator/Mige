@@ -124,25 +124,37 @@ fn encrypt_to_bw(enc_key: &[u8], mac_key: &[u8], plain: &str) -> String {
     format!("2.{}|{}|{}", B64.encode(&iv), B64.encode(&ct), B64.encode(&mac))
 }
 
-/// 解密 Bitwarden 密文（兼容 `2.iv|ct|mac`，也兼容没有前缀的老格式）
-fn decrypt_from_bw(enc_key: &[u8], mac_key: &[u8], value: &str) -> Result<String, String> {
+/// 解密 Bitwarden 密文为原始字节。
+///
+/// 前缀类型：`2.` = AesCbc256_HmacSha256_B64（MAC 用 macKey），
+/// `0.` = AesCbc256_B64（MAC 用 encKey）；无前缀时按 2 处理。
+/// 注意：账号 userKey 是 64 字节**二进制**，不能强制按 UTF-8 处理。
+fn decrypt_from_bw_bytes(enc_key: &[u8], mac_key: &[u8], value: &str) -> Result<Vec<u8>, String> {
     let text = value.trim();
-    let body = text.strip_prefix("2.").unwrap_or(text);
+    let (enc_type, body) = match text.find('.') {
+        Some(index) => (text[..index].parse::<u8>().unwrap_or(2), &text[index + 1..]),
+        None => (2u8, text),
+    };
     let parts: Vec<&str> = body.split('|').collect();
-    if parts.len() != 3 {
+    if parts.len() < 3 {
         return Err("BAD_CIPHER_FORMAT".to_string());
     }
     let iv = B64.decode(parts[0]).map_err(|_| "BAD_IV".to_string())?;
     let ct = B64.decode(parts[1]).map_err(|_| "BAD_CT".to_string())?;
     let mac = B64.decode(parts[2]).map_err(|_| "BAD_MAC".to_string())?;
+    let mac_key_used = if enc_type == 0 { enc_key } else { mac_key };
     let mut mac_input = iv.clone();
     mac_input.extend_from_slice(&ct);
-    let expected = hmac_sha256(mac_key, &mac_input);
-    if !constant_time_eq(&expected, &mac) {
+    if !constant_time_eq(&hmac_sha256(mac_key_used, &mac_input), &mac) {
         return Err("BW_MAC_MISMATCH".to_string());
     }
-    let plain = aes_cbc_decrypt(enc_key, &iv, &ct)?;
-    String::from_utf8(plain).map_err(|_| "INVALID_UTF8".to_string())
+    aes_cbc_decrypt(enc_key, &iv, &ct)
+}
+
+/// 解密 Bitwarden 密文为文本（条目字段用）
+fn decrypt_from_bw(enc_key: &[u8], mac_key: &[u8], value: &str) -> Result<String, String> {
+    let bytes = decrypt_from_bw_bytes(enc_key, mac_key, value)?;
+    String::from_utf8(bytes).map_err(|_| "INVALID_UTF8".to_string())
 }
 
 /// 从 JWT 中取 sub（当前用户 UUID）
@@ -259,6 +271,7 @@ async fn request_token(base: &str, form: Vec<(&'static str, String)>) -> Result<
     let response = client()?
         .post(&url)
         .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
         .form(&form)
         .send()
         .await
@@ -302,15 +315,16 @@ pub async fn login(server_url: &str, email: &str, password: &str) -> Result<BwSe
     let master_hash = crypto::pbkdf2_sha256(&master_key, password.as_bytes(), 1, 32);
 
     let device_id = uuid::Uuid::new_v4().to_string();
+    // client_id / deviceType 与鸿蒙版（已验证可与 Vaultwarden 通信）保持一致
     let form = vec![
         ("grant_type", "password".to_string()),
-        ("username", email.clone()),
+        ("username", email.to_lowercase()),
         ("password", B64.encode(&master_hash)),
         ("scope", "api offline_access".to_string()),
-        ("client_id", "app".to_string()),
-        ("deviceType", "7".to_string()),
+        ("client_id", "web".to_string()),
+        ("deviceType", "10".to_string()),
         ("deviceIdentifier", device_id),
-        ("deviceName", "mige-win".to_string()),
+        ("deviceName", "Mige".to_string()),
     ];
     let token: Value = request_token(&base, form).await?;
 
@@ -325,13 +339,14 @@ pub async fn login(server_url: &str, email: &str, password: &str) -> Result<BwSe
     let stretch_mac = hkdf_expand(&master_key, "mac", 32);
 
     let user_key = if let Some(key_value) = token.get("Key").and_then(|v| v.as_str()) {
-        let decrypted = decrypt_from_bw(&stretch_enc, &stretch_mac, key_value)
-            .map_err(|_| "无法解密账号密钥：请确认主密码正确".to_string())?;
-        // Vaultwarden 返回 64 字节原始 userKey；官方云端可能是 base64 文本
+        let decrypted = decrypt_from_bw_bytes(&stretch_enc, &stretch_mac, key_value)
+            .map_err(|e| format!("无法解密账号密钥（{e}）：请确认主密码正确"))?;
+        // Vaultwarden 返回 64 字节原始 userKey（二进制，非 UTF-8）；官方云端可能是 base64 文本
         if decrypted.len() == 64 {
-            decrypted.as_bytes().to_vec()
+            decrypted
         } else {
-            B64.decode(decrypted.trim()).map_err(|_| "账号密钥格式不正确".to_string())?
+            let text = String::from_utf8(decrypted).map_err(|_| "账号密钥格式不正确".to_string())?;
+            B64.decode(text.trim()).map_err(|_| "账号密钥格式不正确".to_string())?
         }
     } else {
         return Err("登录响应缺少账号密钥（Key）".to_string());
@@ -360,7 +375,7 @@ pub async fn refresh(session: &mut BwSession) -> Result<(), String> {
     let form = vec![
         ("grant_type", "refresh_token".to_string()),
         ("refresh_token", session.refresh_token.clone()),
-        ("client_id", "app".to_string()),
+        ("client_id", "web".to_string()),
     ];
     let token = request_token(&session.server, form).await?;
     let access = token.get("access_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -627,10 +642,109 @@ mod tests {
         assert_eq!(jwt_subject("not-a-jwt"), "");
     }
 
+
     #[test]
     fn server_normalized() {
         assert_eq!(normalize_server(""), "https://vault.bitwarden.com");
         assert_eq!(normalize_server("vault.example.com/"), "https://vault.example.com");
         assert_eq!(normalize_server("http://192.168.1.2:8080/"), "http://192.168.1.2:8080");
+    }
+
+    /// 真实服务器联调：登录 + 拉取（默认跳过，凭据只走环境变量）
+    #[test]
+    #[ignore]
+    fn bw_live_sync() {
+        let (Ok(server), Ok(email), Ok(password)) = (
+            std::env::var("BW_SERVER"),
+            std::env::var("BW_EMAIL"),
+            std::env::var("BW_PASSWORD"),
+        ) else {
+            println!("未设置 BW_SERVER / BW_EMAIL / BW_PASSWORD，跳过联调");
+            return;
+        };
+        let mut session =
+            tauri::async_runtime::block_on(login(&server, &email, &password)).expect("登录失败");
+
+        // 先看服务器原始数据，确认「0 条」是库真的空，还是解析过滤掉了
+        let raw = tauri::async_runtime::block_on(async {
+            let resp = client()
+                .unwrap()
+                .get(format!("{}/api/sync", session.server))
+                .bearer_auth(&session.access_token)
+                .send()
+                .await
+                .unwrap();
+            resp.json::<Value>().await.unwrap()
+        });
+        let ciphers = raw.get("ciphers").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        println!("服务器 ciphers 原始数量 = {}", ciphers.len());
+        for cipher in ciphers.iter().take(6) {
+            println!(
+                "  type={:?} 名称密文长度={:?} 已删除={:?}",
+                cipher.get("type").and_then(|v| v.as_i64()),
+                cipher.get("name").and_then(|v| v.as_str()).map(|s| s.len()),
+                cipher.get("deletedDate").and_then(|v| v.as_str())
+            );
+        }
+        println!("folders 数量 = {:?}", raw.get("folders").and_then(|v| v.as_array()).map(|a| a.len()));
+
+        let items = tauri::async_runtime::block_on(sync_vault(&mut session)).expect("拉取失败");
+        println!("解析出 {} 条条目", items.len());
+    }
+
+    /// 真实服务器联调：上传一条测试条目 → 拉回校验 → 删除（默认跳过）
+    #[test]
+    #[ignore]
+    fn bw_live_roundtrip() {
+        let (Ok(server), Ok(email), Ok(password)) = (
+            std::env::var("BW_SERVER"),
+            std::env::var("BW_EMAIL"),
+            std::env::var("BW_PASSWORD"),
+        ) else {
+            println!("未设置 BW_SERVER / BW_EMAIL / BW_PASSWORD，跳过联调");
+            return;
+        };
+        let mut session =
+            tauri::async_runtime::block_on(login(&server, &email, &password)).expect("登录失败");
+
+        let mut item = VaultItem::default();
+        item.id = "live-test".to_string();
+        item.name = "密阁同步测试（可删）".to_string();
+        item.username = "mige-test-user".to_string();
+        item.password = "P@ssw0rd-测试123".to_string();
+        item.url = "https://example.com".to_string();
+        item.notes = "由联调测试自动创建，测试结束会删除".to_string();
+
+        let bw_id = tauri::async_runtime::block_on(upload_item(&mut session, &item)).expect("上传失败");
+        println!("上传成功 bw_id={bw_id}");
+
+        let pulled = tauri::async_runtime::block_on(sync_vault(&mut session)).expect("拉取失败");
+        println!("拉回 {} 条", pulled.len());
+        let found = pulled.iter().find(|x| x.bw_id == bw_id);
+        match found {
+            Some(x) => println!(
+                "校验通过：名称={:?} 账号={:?} 密码匹配={} 网址={:?}",
+                x.name,
+                x.username,
+                x.password == item.password,
+                x.url
+            ),
+            None => println!("警告：上传后未在拉取结果中找到该条目"),
+        }
+
+        // 清理测试数据
+        let status = tauri::async_runtime::block_on(async {
+            client()
+                .unwrap()
+                .delete(format!("{}/api/ciphers/{bw_id}", session.server))
+                .bearer_auth(&session.access_token)
+                .send()
+                .await
+                .map(|r| r.status().as_u16())
+                .unwrap_or(0)
+        });
+        println!("删除测试条目 HTTP={status}");
+        let after = tauri::async_runtime::block_on(sync_vault(&mut session)).expect("拉取失败");
+        println!("清理后剩余 {} 条", after.len());
     }
 }
