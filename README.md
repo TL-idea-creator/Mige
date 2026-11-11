@@ -49,6 +49,22 @@ npm run tauri build    # 本机打 Windows 安装包
 
 **前置条件**：Node 18+、Rust（MSVC 工具链）、Visual Studio 2022（C++ 桌面开发）、WebView2 运行时（Win10/11 自带）。
 
+### 已构建的 Windows 安装包
+
+```powershell
+npx tauri build --bundles nsis,msi      # 一次产出两种格式
+```
+
+| 文件 | 大小 | 说明 |
+| --- | --- | --- |
+| `密阁_1.0.0_x64-setup.exe` | 1.85 MB | NSIS 安装器，推荐；支持静默安装 `/S` |
+| `密阁_1.0.0_x64_zh-CN.msi` | 2.50 MB | MSI，适合域环境／批量部署 |
+
+- 产物目录：`src-tauri/target/release/bundle/{nsis,msi}/`，`installers/` 下为归档副本（不入库）
+- 安装位置：`%LOCALAPPDATA%\密阁`（当前用户，无需管理员权限）
+- 卸载：开始菜单「密阁」文件夹内，或 `%LOCALAPPDATA%\密阁\uninstall.exe`
+- **未做代码签名**：首次运行 SmartScreen 会提示「Windows 已保护你的电脑」，点「更多信息 → 仍要运行」即可
+
 ## 技术栈
 
 | 层 | 选型 | 说明 |
