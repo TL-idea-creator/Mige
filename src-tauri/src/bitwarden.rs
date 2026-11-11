@@ -1,7 +1,9 @@
 //! Vaultwarden / Bitwarden 同步。
 //!
 //! 协议细节与鸿蒙版实现一致：
-//! - 主密钥 = PBKDF2-SHA256(主密码, email 小写, kdfIterations, 32)
+//! - 主密钥 = KDF(主密码, email 小写, 参数)：
+//!   - PBKDF2-SHA256（`kdf=0`，默认 600000 次）
+//!   - Argon2id（`kdf=1`，memory 单位 MiB、parallelism 条带数，Vaultwarden 新版默认）
 //! - 登录用 `masterPasswordHash` = PBKDF2-SHA256(masterKey, 主密码, 1, 32) 的 base64
 //! - 拉伸密钥用 **HKDF-Expand only**（info = `enc` / `mac`），不是 extract+expand
 //! - 账号密文形如 `2.<iv>|<ct>|<mac>`，AES-256-CBC + HMAC-SHA256(iv‖ct)
@@ -34,6 +36,26 @@ pub struct BwSession {
     pub user_key: Vec<u8>,
     pub user_id: String,
     pub last_sync_at: i64,
+}
+
+/// 服务器返回的 KDF 配置（prelogin 结果）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KdfConfig {
+    /// 0 = PBKDF2-SHA256，1 = Argon2id
+    pub kdf_type: u64,
+    /// PBKDF2 迭代次数 / Argon2 时间成本（t）
+    pub iterations: u32,
+    /// 仅 Argon2：内存成本，单位 MiB
+    pub memory_mib: u32,
+    /// 仅 Argon2：并行度（条带数）
+    pub parallelism: u32,
+}
+
+impl Default for KdfConfig {
+    fn default() -> Self {
+        // Bitwarden/Vaultwarden 的默认值
+        KdfConfig { kdf_type: 0, iterations: 600_000, memory_mib: 64, parallelism: 4 }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,7 +184,7 @@ fn client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("HTTP_CLIENT_FAILED: {e}"))
 }
 
-async fn prelogin(base: &str, email: &str) -> Result<u32, String> {
+async fn prelogin(base: &str, email: &str) -> Result<KdfConfig, String> {
     let url = format!("{base}/identity/accounts/prelogin");
     let response = client()?
         .post(&url)
@@ -174,11 +196,62 @@ async fn prelogin(base: &str, email: &str) -> Result<u32, String> {
         return Err(format!("预登录失败（HTTP {}）", response.status().as_u16()));
     }
     let body: Value = response.json().await.map_err(|e| format!("解析预登录响应失败：{e}"))?;
-    let kdf = body.get("kdf").and_then(|v| v.as_u64()).unwrap_or(0);
-    if kdf != 0 {
-        return Err("该账号使用 Argon2 KDF，当前版本暂不支持，请在 Vaultwarden 网页端切换到 PBKDF2".to_string());
+    let kdf_type = body.get("kdf").and_then(|v| v.as_u64()).unwrap_or(0);
+    let iterations = body
+        .get("kdfIterations")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .unwrap_or(KdfConfig::default().iterations);
+    let memory_mib = body
+        .get("kdfMemory")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .filter(|v| *v > 0)
+        .unwrap_or(KdfConfig::default().memory_mib);
+    let parallelism = body
+        .get("kdfParallelism")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32)
+        .filter(|v| *v > 0)
+        .unwrap_or(KdfConfig::default().parallelism);
+    Ok(KdfConfig { kdf_type, iterations, memory_mib, parallelism })
+}
+
+/// 由主密码派生 32 字节主密钥（Argon2id 的 salt 与 PBKDF2 一样是 email 小写）
+fn derive_master_key(password: &str, email: &str, kdf: &KdfConfig) -> Result<Vec<u8>, String> {
+    let salt = email.to_lowercase();
+    match kdf.kdf_type {
+        0 => Ok(crypto::pbkdf2_sha256(
+            password.as_bytes(),
+            salt.as_bytes(),
+            kdf.iterations.max(1),
+            32,
+        )),
+        1 => {
+            // Bitwarden 的 memory 单位是 MiB，argon2 crate 要 KiB
+            let memory_kib = kdf.memory_mib.saturating_mul(1024);
+            let params = argon2::Params::new(
+                memory_kib,
+                kdf.iterations.max(1),
+                kdf.parallelism.max(1),
+                Some(32),
+            )
+            .map_err(|e| format!("Argon2 参数无效：{e}"))?;
+            let hasher = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+            let mut out = vec![0u8; 32];
+            hasher
+                .hash_password_into(password.as_bytes(), salt.as_bytes(), &mut out)
+                .map_err(|e| {
+                    if salt.len() < 8 {
+                        "邮箱地址过短，无法用于 Argon2 密钥派生，请使用完整注册邮箱".to_string()
+                    } else {
+                        format!("Argon2 派生失败：{e}")
+                    }
+                })?;
+            Ok(out)
+        }
+        other => Err(format!("服务器使用了不支持的 KDF 类型：{other}")),
     }
-    Ok(body.get("kdfIterations").and_then(|v| v.as_u64()).unwrap_or(600_000) as u32)
 }
 
 async fn request_token(base: &str, form: Vec<(&'static str, String)>) -> Result<Value, String> {
@@ -193,10 +266,24 @@ async fn request_token(base: &str, form: Vec<(&'static str, String)>) -> Result<
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
     if !status.is_success() {
+        // 把服务器给的具体原因带出来（Bitwarden 协议返回 {"error":…,"error_description":…}）
+        let detail = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| {
+                let err = v.get("error").and_then(|x| x.as_str()).unwrap_or("");
+                let desc = v.get("error_description").and_then(|x| x.as_str()).unwrap_or("");
+                let joined = format!("{err} {desc}").trim().to_string();
+                if joined.is_empty() {
+                    None
+                } else {
+                    Some(joined)
+                }
+            })
+            .unwrap_or_else(|| text.chars().take(160).collect::<String>().replace('\n', " "));
         return Err(if status.as_u16() == 429 {
             "登录失败次数过多，服务器已临时限流，请稍后再试".to_string()
         } else {
-            format!("登录失败（HTTP {}）：请确认账号填写的是注册邮箱，且主密码正确", status.as_u16())
+            format!("登录失败（HTTP {}）：{detail}", status.as_u16())
         });
     }
     serde_json::from_str(&text).map_err(|e| format!("解析令牌失败：{e}"))
@@ -210,8 +297,8 @@ pub async fn login(server_url: &str, email: &str, password: &str) -> Result<BwSe
         return Err("请填写邮箱与主密码".to_string());
     }
 
-    let iterations = prelogin(&base, &email).await?;
-    let master_key = crypto::pbkdf2_sha256(password.as_bytes(), email.to_lowercase().as_bytes(), iterations, 32);
+    let kdf = prelogin(&base, &email).await?;
+    let master_key = derive_master_key(password, &email, &kdf)?;
     let master_hash = crypto::pbkdf2_sha256(&master_key, password.as_bytes(), 1, 32);
 
     let device_id = uuid::Uuid::new_v4().to_string();
@@ -259,7 +346,7 @@ pub async fn login(server_url: &str, email: &str, password: &str) -> Result<BwSe
         user_id: jwt_subject(&access_token),
         access_token,
         refresh_token,
-        kdf_iterations: iterations,
+        kdf_iterations: kdf.iterations,
         user_key,
         last_sync_at: 0,
     })
@@ -434,6 +521,77 @@ pub async fn upload_item(session: &mut BwSession, item: &VaultItem) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn argon2id_master_key_matches_bitwarden_params() {
+        // 与 Bitwarden/Vaultwarden 一致的参数：memory 单位为 MiB → KiB 传入 argon2
+        let kdf = KdfConfig { kdf_type: 1, iterations: 6, memory_mib: 32, parallelism: 4 };
+        let key = derive_master_key("test-master-pw", "user@example.com", &kdf).unwrap();
+        assert_eq!(key.len(), 32);
+        // 确定性：同样输入必须得到同样密钥
+        assert_eq!(key, derive_master_key("test-master-pw", "user@example.com", &kdf).unwrap());
+        // 大小写不敏感（salt 用 email 小写）
+        assert_eq!(key, derive_master_key("test-master-pw", "user@EXAMPLE.com", &kdf).unwrap());
+        // 换密码必然不同
+        assert_ne!(key, derive_master_key("test-master-pw2", "user@example.com", &kdf).unwrap());
+    }
+
+    #[test]
+    fn pbkdf2_and_argon2_are_distinct() {
+        let pbkdf2 = derive_master_key(
+            "pw",
+            "tester@example.com",
+            &KdfConfig { kdf_type: 0, iterations: 1000, memory_mib: 64, parallelism: 4 },
+        )
+        .unwrap();
+        let argon2id = derive_master_key(
+            "pw",
+            "tester@example.com",
+            &KdfConfig { kdf_type: 1, iterations: 3, memory_mib: 16, parallelism: 2 },
+        )
+        .unwrap();
+        assert_eq!(pbkdf2.len(), 32);
+        assert_eq!(argon2id.len(), 32);
+        assert_ne!(pbkdf2, argon2id);
+        // 未知 KDF 类型必须报错，而不是静默降级
+        assert!(derive_master_key("pw", "tester@example.com", &KdfConfig { kdf_type: 2, ..Default::default() }).is_err());
+    }
+
+    #[test]
+    fn missing_kdf_fields_fall_back_to_defaults() {
+        let d = KdfConfig::default();
+        assert_eq!(d.kdf_type, 0);
+        assert_eq!(d.iterations, 600_000);
+        assert_eq!(d.memory_mib, 64);
+        assert_eq!(d.parallelism, 4);
+    }
+
+    /// 真实服务器联调（默认跳过，凭据只走环境变量，不入库）：
+    /// ```powershell
+    /// $env:BW_SERVER='https://vault.example.com'; $env:BW_EMAIL='me@example.com'; $env:BW_PASSWORD='…'
+    /// cargo test --lib bw_live_login -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn bw_live_login() {
+        let (Ok(server), Ok(email), Ok(password)) = (
+            std::env::var("BW_SERVER"),
+            std::env::var("BW_EMAIL"),
+            std::env::var("BW_PASSWORD"),
+        ) else {
+            println!("未设置 BW_SERVER / BW_EMAIL / BW_PASSWORD，跳过联调");
+            return;
+        };
+        match tauri::async_runtime::block_on(login(&server, &email, &password)) {
+            Ok(session) => println!(
+                "登录成功：user_id={} kdf_iterations={} user_key_len={}",
+                session.user_id,
+                session.kdf_iterations,
+                session.user_key.len()
+            ),
+            Err(err) => panic!("登录失败：{err}"),
+        }
+    }
 
     #[test]
     fn hkdf_expand_is_deterministic_and_distinct() {

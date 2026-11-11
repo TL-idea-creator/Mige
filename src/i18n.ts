@@ -372,7 +372,7 @@ const ZH: Strings = {
   bwPassword: '主密码（仅用于登录，不会保存）',
   bwConnectButton: '连接并同步',
   bwConnecting: '连接中…',
-  bwKdfHint: '仅支持 PBKDF2 账号（Vaultwarden 默认）；Argon2 需先在网页端切换。自签名证书会自动跳过校验。',
+  bwKdfHint: '支持 PBKDF2 与 Argon2id 两种 KDF（Vaultwarden 新版默认 Argon2id）。自签名证书会自动跳过校验。',
   dataSection: '数据与备份',
   exportLabel: '导出（可选备份密码，加密备份需 ≥8 位）',
   backupPasswordPlaceholder: '备份密码（用于加密备份）',
@@ -576,7 +576,7 @@ const EN: Strings = {
   bwConnectButton: 'Connect and sync',
   bwConnecting: 'Connecting…',
   bwKdfHint:
-    'Only PBKDF2 accounts are supported (Vaultwarden default); switch Argon2 in the web vault first. Self-signed certificates are accepted.',
+    'Supports both PBKDF2 and Argon2id KDFs (newer Vaultwarden defaults to Argon2id). Self-signed certificates are accepted.',
   dataSection: 'Data & backup',
   exportLabel: 'Export (backup password, min 8 chars for encrypted)',
   backupPasswordPlaceholder: 'Backup password (for encrypted backup)',
