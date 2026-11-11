@@ -10,3 +10,4 @@ src-tauri/gen/schemas/
 Thumbs.db
 gen/
 installers/
+pnpm-workspace.yaml
