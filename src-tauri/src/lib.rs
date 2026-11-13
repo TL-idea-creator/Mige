@@ -392,11 +392,8 @@ async fn bw_push(state: State<'_, AppState>, items: Vec<VaultItem>) -> Result<Ve
     };
     let mut updated = Vec::new();
     for item in &items {
-        let id = if item.bw_id.trim().is_empty() {
-            bitwarden::upload_item(&mut session, item).await?
-        } else {
-            bitwarden::update_item(&mut session, item).await?
-        };
+        // 有 bw_id 的先尝试更新；服务器上没有这条（换了服务器 / 已被删除）则自动新建
+        let id = bitwarden::push_item(&mut session, item).await?;
         let mut copy = item.clone();
         copy.bw_id = id;
         updated.push(copy);

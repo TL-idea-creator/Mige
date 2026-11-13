@@ -598,9 +598,36 @@ async fn send_cipher(
             .map_err(|e| format!("上传请求失败：{e}"))?;
     }
     if !response.status().is_success() {
-        return Err(format!("上传失败（HTTP {}）", response.status().as_u16()));
+        let code = response.status().as_u16();
+        let body = response.text().await.unwrap_or_default();
+        let brief: String = body.chars().take(200).collect();
+        return Err(format!("上传失败（HTTP {code}）：{brief}"));
     }
     Ok(response.json().await.unwrap_or(Value::Null))
+}
+
+/// 判断错误是否为「服务器上没有这条记录」。
+/// Vaultwarden 对不存在的 cipher id 做 PUT 会返回 400（部分实现返回 404）。
+pub fn record_missing(err: &str) -> bool {
+    err.contains("HTTP 400") || err.contains("HTTP 404")
+}
+
+/// 同步单个条目：没有 bwId 走新建；有则先更新，服务器上不存在就退化为新建。
+///
+/// 后者覆盖两种真实场景：换了 Vaultwarden 服务器（本地 bwId 属于旧服务器），
+/// 以及条目已在服务端被删除。
+pub async fn push_item(session: &mut BwSession, item: &VaultItem) -> Result<String, String> {
+    if item.bw_id.trim().is_empty() {
+        return upload_item(session, item).await;
+    }
+    match update_item(session, item).await {
+        Ok(id) => Ok(id),
+        Err(err) if record_missing(&err) => {
+            let id = upload_item(session, item).await?;
+            Ok(id)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// 新建条目，返回服务端 id
@@ -817,6 +844,65 @@ mod tests {
         assert_eq!(jwt_subject("not-a-jwt"), "");
     }
 
+
+
+    #[test]
+    fn record_missing_detects_400_and_404() {
+        // Vaultwarden 对不存在的 cipher id 做 PUT 返回 400，部分实现返回 404
+        assert!(record_missing("上传失败（HTTP 400）：{\"error\":\"x\"}"));
+        assert!(record_missing("上传失败（HTTP 404）："));
+        assert!(!record_missing("上传失败（HTTP 422）：数据不合法"));
+        assert!(!record_missing("无法连接服务器：timed out"));
+    }
+
+    /// 真机联调：条目带着「旧服务器」的 bwId 时，push_item 应自动退化为新建
+    #[test]
+    #[ignore]
+    fn bw_live_push_with_stale_id() {
+        let (Ok(server), Ok(email), Ok(password)) = (
+            std::env::var("BW_SERVER"),
+            std::env::var("BW_EMAIL"),
+            std::env::var("BW_PASSWORD"),
+        ) else {
+            println!("未设置环境变量，跳过");
+            return;
+        };
+        let mut session =
+            tauri::async_runtime::block_on(login(&server, &email, &password)).expect("登录失败");
+
+        // 用一个随机 UUID 假装是「另一台服务器上的 id」
+        let stale_id = uuid::Uuid::new_v4().to_string();
+        let mut item = VaultItem::default();
+        item.id = "stale-test".to_string();
+        item.name = "密阁换服务器测试（可删）".to_string();
+        item.username = "stale-user".to_string();
+        item.password = "P@ss-迁移".to_string();
+        item.bw_id = stale_id.clone();
+
+        let new_id = tauri::async_runtime::block_on(push_item(&mut session, &item))
+            .expect("带着旧 id 同步应自动新建，而不是报 400");
+        println!("旧 id={stale_id}");
+        println!("新 id={new_id}（自动新建={}）", new_id != stale_id);
+
+        let pulled = tauri::async_runtime::block_on(sync_vault(&mut session)).expect("拉取失败");
+        match pulled.iter().find(|x| x.bw_id == new_id) {
+            Some(x) => println!("服务器上已存在：账号={:?} 密码匹配={}", x.username, x.password == item.password),
+            None => println!("警告：新建后未在拉取结果中找到"),
+        }
+
+        // 清理
+        let status = tauri::async_runtime::block_on(async {
+            client()
+                .unwrap()
+                .delete(format!("{}/api/ciphers/{new_id}", session.server))
+                .bearer_auth(&session.access_token)
+                .send()
+                .await
+                .map(|r| r.status().as_u16())
+                .unwrap_or(0)
+        });
+        println!("删除测试条目 HTTP={status}");
+    }
 
     #[test]
     fn server_normalized() {
