@@ -128,6 +128,18 @@ fn unlock(state: State<AppState>, password: String) -> Result<VaultData, String>
 
     let mut session = state.session.lock().map_err(|_| "STATE_LOCK_FAILED".to_string())?;
     *session = Session { key: Some(master), data: Some(data.clone()) };
+    drop(session);
+
+    // 解锁后恢复 Vaultwarden 会话（配置随密码库加密保存，重启后不必重新登录）
+    let restored = data
+        .settings
+        .bitwarden
+        .as_ref()
+        .and_then(|v| serde_json::from_value::<bitwarden::BitwardenConfig>(v.clone()).ok())
+        .and_then(|cfg| bitwarden::BwSession::from_config(&cfg));
+    if let Ok(mut guard) = state.bw.lock() {
+        *guard = restored;
+    }
     Ok(data)
 }
 
@@ -135,6 +147,11 @@ fn unlock(state: State<AppState>, password: String) -> Result<VaultData, String>
 fn lock(state: State<AppState>) -> Result<(), String> {
     let mut session = state.session.lock().map_err(|_| "STATE_LOCK_FAILED".to_string())?;
     *session = Session::locked();
+    drop(session);
+    // 锁定后一并丢弃同步会话（配置仍留在加密库里，下次解锁自动恢复）
+    if let Ok(mut guard) = state.bw.lock() {
+        *guard = None;
+    }
     Ok(())
 }
 
@@ -290,6 +307,45 @@ fn open_url(url: String) -> Result<(), String> {
 
 // ---------- Vaultwarden / Bitwarden 同步 ----------
 
+/// 把当前同步会话写进密码库配置并落盘（与鸿蒙版存放位置一致：settings.bitwarden）
+fn persist_bw_session(state: &AppState, bw: &bitwarden::BwSession) -> Result<(), String> {
+    let mut session = state.session.lock().map_err(|_| "STATE_LOCK_FAILED".to_string())?;
+    let key = VaultKey(session.key.as_ref().ok_or_else(|| "LOCKED".to_string())?.0);
+    let data = session.data.as_mut().ok_or_else(|| "LOCKED".to_string())?;
+    data.settings.bitwarden = Some(
+        serde_json::to_value(bw.to_config()).map_err(|e| format!("保存同步配置失败：{e}"))?,
+    );
+    state.store.save_vault(&key, data)
+}
+
+/// 清除密码库里的同步配置（断开连接时调用）
+fn clear_bw_session(state: &AppState) -> Result<(), String> {
+    let mut session = state.session.lock().map_err(|_| "STATE_LOCK_FAILED".to_string())?;
+    let key = VaultKey(session.key.as_ref().ok_or_else(|| "LOCKED".to_string())?.0);
+    let data = session.data.as_mut().ok_or_else(|| "LOCKED".to_string())?;
+    if data.settings.bitwarden.is_none() {
+        return Ok(());
+    }
+    data.settings.bitwarden = None;
+    state.store.save_vault(&key, data)
+}
+
+fn bw_status_of(state: &AppState, session: &bitwarden::BwSession) -> bitwarden::BwStatus {
+    let item_count = state
+        .session
+        .lock()
+        .ok()
+        .and_then(|guard| guard.data.as_ref().map(|d| d.items.len()))
+        .unwrap_or(0);
+    bitwarden::BwStatus {
+        connected: true,
+        server: session.server.clone(),
+        email: session.email.clone(),
+        last_sync_at: session.last_sync_at,
+        item_count,
+    }
+}
+
 #[tauri::command]
 async fn bw_connect(
     state: State<'_, AppState>,
@@ -298,13 +354,8 @@ async fn bw_connect(
     password: String,
 ) -> Result<bitwarden::BwStatus, String> {
     let session = bitwarden::login(&server, &email, &password).await?;
-    let status = bitwarden::BwStatus {
-        connected: true,
-        server: session.server.clone(),
-        email: session.email.clone(),
-        last_sync_at: session.last_sync_at,
-        item_count: 0,
-    };
+    let status = bw_status_of(&state, &session);
+    persist_bw_session(&state, &session)?;
     let mut guard = state.bw.lock().map_err(|_| "STATE_LOCK_FAILED".to_string())?;
     *guard = Some(session);
     Ok(status)
@@ -313,13 +364,7 @@ async fn bw_connect(
 #[tauri::command]
 fn bw_status(state: State<AppState>) -> Result<Option<bitwarden::BwStatus>, String> {
     let guard = state.bw.lock().map_err(|_| "STATE_LOCK_FAILED".to_string())?;
-    Ok(guard.as_ref().map(|s| bitwarden::BwStatus {
-        connected: true,
-        server: s.server.clone(),
-        email: s.email.clone(),
-        last_sync_at: s.last_sync_at,
-        item_count: 0,
-    }))
+    Ok(guard.as_ref().map(|s| bw_status_of(&state, s)))
 }
 
 #[tauri::command]
@@ -329,6 +374,8 @@ async fn bw_pull(state: State<'_, AppState>) -> Result<Vec<VaultItem>, String> {
         guard.clone().ok_or_else(|| "尚未连接 Vaultwarden".to_string())?
     };
     let items = bitwarden::sync_vault(&mut session).await?;
+    session.last_sync_at = crate::transfer::now_ms();
+    persist_bw_session(&state, &session)?;
     {
         let mut guard = state.bw.lock().map_err(|_| "STATE_LOCK_FAILED".to_string())?;
         *guard = Some(session);
@@ -336,7 +383,7 @@ async fn bw_pull(state: State<'_, AppState>) -> Result<Vec<VaultItem>, String> {
     Ok(items)
 }
 
-/// 上传本地未关联条目，返回带 bwId 的副本（前端据此写回并去重）
+/// 上传本地条目：未关联的新建、已关联的更新，返回带 bwId 的副本（前端据此写回）
 #[tauri::command]
 async fn bw_push(state: State<'_, AppState>, items: Vec<VaultItem>) -> Result<Vec<VaultItem>, String> {
     let mut session = {
@@ -345,11 +392,17 @@ async fn bw_push(state: State<'_, AppState>, items: Vec<VaultItem>) -> Result<Ve
     };
     let mut updated = Vec::new();
     for item in &items {
-        let id = bitwarden::upload_item(&mut session, item).await?;
+        let id = if item.bw_id.trim().is_empty() {
+            bitwarden::upload_item(&mut session, item).await?
+        } else {
+            bitwarden::update_item(&mut session, item).await?
+        };
         let mut copy = item.clone();
         copy.bw_id = id;
         updated.push(copy);
     }
+    session.last_sync_at = crate::transfer::now_ms();
+    persist_bw_session(&state, &session)?;
     {
         let mut guard = state.bw.lock().map_err(|_| "STATE_LOCK_FAILED".to_string())?;
         *guard = Some(session);
@@ -361,7 +414,8 @@ async fn bw_push(state: State<'_, AppState>, items: Vec<VaultItem>) -> Result<Ve
 fn bw_disconnect(state: State<AppState>) -> Result<(), String> {
     let mut guard = state.bw.lock().map_err(|_| "STATE_LOCK_FAILED".to_string())?;
     *guard = None;
-    Ok(())
+    drop(guard);
+    clear_bw_session(&state)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -409,4 +463,66 @@ pub fn run() {    tauri::Builder::default()
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 配置随密码库加密落盘、重新加载后能完整恢复（回归「重启后 Vaultwarden 设置丢失」）
+    #[test]
+    fn vault_roundtrip_keeps_vaultwarden_config() {
+        let dir = std::env::temp_dir().join(format!("mige-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::new(dir.clone());
+
+        // 建库：随机主密钥用密码派生的 KEK 包裹
+        let salt = crypto::random_bytes(16);
+        let kek =
+            VaultKey::from_slice(&crypto::pbkdf2_sha256(b"test-master-pw", &salt, 1000, 32)).unwrap();
+        let master = VaultKey::random();
+        let wrapped = crypto::seal(&kek, master.as_slice());
+        let mut meta = store.load_meta();
+        meta.set_wrapped(&salt, 1000, &wrapped);
+        store.save_meta(&meta).unwrap();
+
+        // 写入带 Vaultwarden 配置的库
+        let bw_session = bitwarden::BwSession {
+            server: "https://vault.example.com".to_string(),
+            email: "user@example.com".to_string(),
+            access_token: "access-abc".to_string(),
+            refresh_token: "refresh-abc".to_string(),
+            kdf_iterations: 600_000,
+            user_key: vec![9u8; 64],
+            user_id: "user-uuid".to_string(),
+            last_sync_at: 4321,
+        };
+        let mut data = VaultData::default();
+        data.settings.bitwarden = Some(serde_json::to_value(bw_session.to_config()).unwrap());
+        store.save_vault(&master, &data).unwrap();
+
+        // 模拟重启：用同一主密钥重新加载，配置应原样回来
+        let loaded = store.load_vault(&master).unwrap();
+        let restored = loaded
+            .settings
+            .bitwarden
+            .clone()
+            .and_then(|v| serde_json::from_value::<bitwarden::BitwardenConfig>(v).ok())
+            .and_then(|cfg| bitwarden::BwSession::from_config(&cfg))
+            .expect("重启后应能恢复同步配置");
+        assert_eq!(restored.server, "https://vault.example.com");
+        assert_eq!(restored.email, "user@example.com");
+        assert_eq!(restored.user_key, vec![9u8; 64]);
+        assert_eq!(restored.user_id, "user-uuid");
+        assert_eq!(restored.last_sync_at, 4321);
+
+        // 断开连接清空配置后，重新加载应为未连接
+        let mut cleared = loaded.clone();
+        cleared.settings.bitwarden = None;
+        store.save_vault(&master, &cleared).unwrap();
+        let reloaded = store.load_vault(&master).unwrap();
+        assert!(reloaded.settings.bitwarden.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

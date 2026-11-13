@@ -24,7 +24,7 @@ type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
 type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 type HmacSha256 = Hmac<Sha256>;
 
-/// 同步用的会话（保存在内存，不落盘）
+/// 同步用的会话（内存态）
 #[derive(Debug, Clone)]
 pub struct BwSession {
     pub server: String,
@@ -36,6 +36,69 @@ pub struct BwSession {
     pub user_key: Vec<u8>,
     pub user_id: String,
     pub last_sync_at: i64,
+}
+
+impl BwSession {
+    /// 转成可持久化的配置（字段命名与鸿蒙版 BitwardenConfig 一致，便于两端互通）
+    pub fn to_config(&self) -> BitwardenConfig {
+        BitwardenConfig {
+            server: self.server.clone(),
+            email: self.email.clone(),
+            kdf_iterations: self.kdf_iterations,
+            enc_key: B64.encode(&self.user_key[..32.min(self.user_key.len())]),
+            mac_key: B64.encode(&self.user_key[32.min(self.user_key.len())..]),
+            user_key: B64.encode(&self.user_key),
+            user_id: self.user_id.clone(),
+            access_token: self.access_token.clone(),
+            refresh_token: self.refresh_token.clone(),
+            expires_at: 0,
+            last_sync_at: self.last_sync_at,
+            allow_insecure: false,
+        }
+    }
+
+    /// 从持久化配置恢复会话；字段不全时返回 None（视为「未连接」）
+    pub fn from_config(cfg: &BitwardenConfig) -> Option<BwSession> {
+        if cfg.server.trim().is_empty() || cfg.user_key.trim().is_empty() {
+            return None;
+        }
+        let user_key = B64.decode(cfg.user_key.trim()).ok()?;
+        if user_key.len() != 64 {
+            return None;
+        }
+        Some(BwSession {
+            server: normalize_server(&cfg.server),
+            email: cfg.email.clone(),
+            access_token: cfg.access_token.clone(),
+            refresh_token: cfg.refresh_token.clone(),
+            kdf_iterations: cfg.kdf_iterations,
+            user_key,
+            user_id: cfg.user_id.clone(),
+            last_sync_at: cfg.last_sync_at,
+        })
+    }
+}
+
+/// 随密码库一起加密落盘的 Vaultwarden 配置。
+/// 字段与鸿蒙版保持一致（camelCase），账号 userKey 以 base64 保存，因此重启后无需重新登录。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct BitwardenConfig {
+    pub server: String,
+    pub email: String,
+    pub kdf_iterations: u32,
+    /// base64(32B) enc 密钥
+    pub enc_key: String,
+    /// base64(32B) mac 密钥
+    pub mac_key: String,
+    /// base64(64B) userKey（enc ‖ mac）
+    pub user_key: String,
+    pub user_id: String,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at: i64,
+    pub last_sync_at: i64,
+    pub allow_insecure: bool,
 }
 
 /// 服务器返回的 KDF 配置（prelogin 结果）
@@ -487,7 +550,8 @@ pub async fn sync_vault(session: &mut BwSession) -> Result<Vec<VaultItem>, Strin
 }
 
 /// 上传一条本地条目，返回服务端 id
-pub async fn upload_item(session: &mut BwSession, item: &VaultItem) -> Result<String, String> {
+/// 构造 cipher 请求体（新建与更新共用）
+fn cipher_payload(session: &BwSession, item: &VaultItem) -> Value {
     let login = json!({
         "username": encrypt_field(session, &item.username),
         "password": encrypt_field(session, &item.password),
@@ -498,20 +562,27 @@ pub async fn upload_item(session: &mut BwSession, item: &VaultItem) -> Result<St
             vec![json!({ "uri": encrypt_field(session, &item.url) })]
         }
     });
-    let payload = json!({
+    json!({
         "type": 1,
         "name": encrypt_field(session, &item.name),
         "notes": encrypt_field(session, &item.notes),
         "favorite": item.favorite,
         "encryptedFor": session.user_id,
         "login": login
-    });
+    })
+}
 
-    let url = format!("{}/api/ciphers", session.server);
+/// 发送 create / update 请求（401 时自动续期重试一次）
+async fn send_cipher(
+    session: &mut BwSession,
+    method: reqwest::Method,
+    url: String,
+    payload: &Value,
+) -> Result<Value, String> {
     let mut response = client()?
-        .post(&url)
+        .request(method.clone(), &url)
         .bearer_auth(&session.access_token)
-        .json(&payload)
+        .json(payload)
         .send()
         .await
         .map_err(|e| format!("上传请求失败：{e}"))?;
@@ -519,9 +590,9 @@ pub async fn upload_item(session: &mut BwSession, item: &VaultItem) -> Result<St
     if response.status().as_u16() == 401 {
         refresh(session).await?;
         response = client()?
-            .post(&url)
+            .request(method, &url)
             .bearer_auth(&session.access_token)
-            .json(&payload)
+            .json(payload)
             .send()
             .await
             .map_err(|e| format!("上传请求失败：{e}"))?;
@@ -529,8 +600,27 @@ pub async fn upload_item(session: &mut BwSession, item: &VaultItem) -> Result<St
     if !response.status().is_success() {
         return Err(format!("上传失败（HTTP {}）", response.status().as_u16()));
     }
-    let body: Value = response.json().await.unwrap_or(Value::Null);
+    Ok(response.json().await.unwrap_or(Value::Null))
+}
+
+/// 新建条目，返回服务端 id
+pub async fn upload_item(session: &mut BwSession, item: &VaultItem) -> Result<String, String> {
+    let payload = cipher_payload(session, item);
+    let url = format!("{}/api/ciphers", session.server);
+    let body = send_cipher(session, reqwest::Method::POST, url, &payload).await?;
     Ok(body.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string())
+}
+
+/// 更新已关联条目（本地改了账号/密码/网址后用它同步到服务器）
+pub async fn update_item(session: &mut BwSession, item: &VaultItem) -> Result<String, String> {
+    if item.bw_id.trim().is_empty() {
+        return Err("该条目尚未关联服务器记录".to_string());
+    }
+    let payload = cipher_payload(session, item);
+    let url = format!("{}/api/ciphers/{}", session.server, item.bw_id);
+    let body = send_cipher(session, reqwest::Method::PUT, url, &payload).await?;
+    let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    Ok(if id.is_empty() { item.bw_id.clone() } else { id.to_string() })
 }
 
 #[cfg(test)]
@@ -606,6 +696,91 @@ mod tests {
             ),
             Err(err) => panic!("登录失败：{err}"),
         }
+    }
+
+    #[test]
+    fn bw_config_serde_uses_camel_case() {
+        // 落盘用的是 serde_json，字段名必须是 camelCase，否则重启后 from_config 读不到
+        let config = BitwardenConfig {
+            server: "https://vault.example.com".to_string(),
+            kdf_iterations: 600_000,
+            user_key: "abc".to_string(),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&config).unwrap();
+        assert!(value.get("kdfIterations").is_some(), "缺少 kdfIterations");
+        assert!(value.get("encKey").is_some(), "缺少 encKey");
+        assert!(value.get("userKey").is_some(), "缺少 userKey");
+        assert!(value.get("lastSyncAt").is_some(), "缺少 lastSyncAt");
+        let back: BitwardenConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(back.kdf_iterations, 600_000);
+        assert_eq!(back.user_key, "abc");
+    }
+
+    #[test]
+    fn bw_config_roundtrip() {
+        let session = BwSession {
+            server: "https://vault.example.com".to_string(),
+            email: "user@example.com".to_string(),
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            kdf_iterations: 600_000,
+            user_key: vec![7u8; 64],
+            user_id: "user-uuid".to_string(),
+            last_sync_at: 1234,
+        };
+        let config = session.to_config();
+        assert_eq!(config.enc_key, B64.encode(&[7u8; 32]));
+        assert_eq!(config.mac_key, B64.encode(&[7u8; 32]));
+        assert_eq!(config.user_key, B64.encode(&[7u8; 64]));
+
+        // 重启后从落盘配置恢复，userKey 与账号信息必须完全一致
+        let restored = BwSession::from_config(&config).expect("应能从配置恢复会话");
+        assert_eq!(restored.server, "https://vault.example.com");
+        assert_eq!(restored.email, "user@example.com");
+        assert_eq!(restored.user_key, vec![7u8; 64]);
+        assert_eq!(restored.user_id, "user-uuid");
+        assert_eq!(restored.last_sync_at, 1234);
+
+        // 配置不完整时视为「未连接」，不能恢复出半残会话
+        let mut broken = config.clone();
+        broken.user_key = String::new();
+        assert!(BwSession::from_config(&broken).is_none());
+        let mut short_key = config.clone();
+        short_key.user_key = B64.encode(&[1u8; 16]);
+        assert!(BwSession::from_config(&short_key).is_none());
+    }
+
+    #[test]
+    fn cipher_payload_encrypts_fields_for_create_and_update() {
+        let session = BwSession {
+            server: "https://vault.example.com".to_string(),
+            email: "user@example.com".to_string(),
+            access_token: "access".to_string(),
+            refresh_token: String::new(),
+            kdf_iterations: 600_000,
+            user_key: vec![3u8; 64],
+            user_id: "user-uuid".to_string(),
+            last_sync_at: 0,
+        };
+        let mut item = VaultItem::default();
+        item.name = "示例站点".to_string();
+        item.username = "alice".to_string();
+        item.password = "P@ss".to_string();
+        item.url = "https://example.com".to_string();
+
+        // 新建与更新共用同一份载荷，字段必须齐全且都加密过
+        let payload = cipher_payload(&session, &item);
+        assert_eq!(payload["type"], 1);
+        assert_eq!(payload["encryptedFor"], "user-uuid");
+        assert!(payload["name"].as_str().unwrap_or("").starts_with("2."));
+        assert!(payload["login"]["password"].as_str().unwrap_or("").starts_with("2."));
+        let enc = &session.user_key[..32];
+        let mac = &session.user_key[32..];
+        let plain = decrypt_from_bw(enc, mac, payload["name"].as_str().unwrap()).unwrap();
+        assert_eq!(plain, "示例站点");
+        let password = decrypt_from_bw(enc, mac, payload["login"]["password"].as_str().unwrap()).unwrap();
+        assert_eq!(password, "P@ss");
     }
 
     #[test]
@@ -720,8 +895,7 @@ mod tests {
 
         let pulled = tauri::async_runtime::block_on(sync_vault(&mut session)).expect("拉取失败");
         println!("拉回 {} 条", pulled.len());
-        let found = pulled.iter().find(|x| x.bw_id == bw_id);
-        match found {
+        match pulled.iter().find(|x| x.bw_id == bw_id) {
             Some(x) => println!(
                 "校验通过：名称={:?} 账号={:?} 密码匹配={} 网址={:?}",
                 x.name,
@@ -730,6 +904,27 @@ mod tests {
                 x.url
             ),
             None => println!("警告：上传后未在拉取结果中找到该条目"),
+        }
+
+        // 模拟「本地修改账密后再同步」：走 update 分支（PUT），不能被当成新条目
+        let mut changed = item.clone();
+        changed.bw_id = bw_id.clone();
+        changed.username = "mige-test-user-updated".to_string();
+        changed.password = "N3w-P@ss-改".to_string();
+        let updated_id =
+            tauri::async_runtime::block_on(update_item(&mut session, &changed)).expect("更新失败");
+        println!("更新成功 id={updated_id}（应与 {bw_id} 相同）");
+
+        let after_update = tauri::async_runtime::block_on(sync_vault(&mut session)).expect("拉取失败");
+        println!("更新后服务器共 {} 条（应仍为 1 条，说明是更新而非新建）", after_update.len());
+        match after_update.iter().find(|x| x.bw_id == bw_id) {
+            Some(x) => println!(
+                "更新校验：账号={:?} 新密码生效={} 旧密码残留={}",
+                x.username,
+                x.password == changed.password,
+                x.password == item.password
+            ),
+            None => println!("警告：更新后找不到该条目"),
         }
 
         // 清理测试数据

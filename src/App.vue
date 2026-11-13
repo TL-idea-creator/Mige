@@ -165,12 +165,28 @@ async function addAuthenticator(item: VaultItem) {
   toast(s.value.authAdded);
 }
 
-/** 导入合并：名称 + 账号 + 密码完全相同的视为重复 */
+/** 合并服务端条目：先按 bwId 就地更新已关联条目，再按「名称+账号+密码」去重，最后才新增 */
 async function mergeItems(incoming: VaultItem[]) {
   if (!data.value) return;
   let added = 0;
+  let updated = 0;
   let skipped = 0;
   for (const item of incoming) {
+    // ① 已关联过这条服务端记录（bwId 相同）→ 就地更新，避免本地改动后拉取产生重复条目
+    const linked = item.bwId ? data.value.items.find((it) => it.bwId === item.bwId) : undefined;
+    if (linked) {
+      linked.name = item.name;
+      linked.username = item.username;
+      linked.password = item.password;
+      linked.url = item.url;
+      linked.notes = item.notes;
+      linked.favorite = item.favorite;
+      if (item.totp) linked.totp = item.totp;
+      linked.updatedAt = Date.now();
+      updated++;
+      continue;
+    }
+    // ② 内容完全一致视为重复（导入 CSV/JSON 场景）
     const exists = data.value.items.some(
       (it) => it.name === item.name && it.username === item.username && it.password === item.password
     );
@@ -182,10 +198,12 @@ async function mergeItems(incoming: VaultItem[]) {
     added++;
   }
   await persist();
-  if (added > 0) {
+  if (updated > 0) {
+    toast(s.value.stBwPulled(updated));
+  } else if (added > 0) {
     toast(s.value.stImported(added));
   } else {
-    toast(s.value.stImported(0) + (skipped > 0 ? ` (${skipped})` : ''));
+    toast(s.value.stBwEmpty + (skipped > 0 ? ` (${skipped})` : ''));
   }
 }
 

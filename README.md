@@ -98,6 +98,13 @@ npx tauri build --bundles nsis,msi      # 一次产出两种格式
 > 标识符已统一为 `org.liqihai.app.mige`。若之前用过 `…mige.win` 的旧版，
 > 旧数据仍在原目录，可先「导出加密备份」再在新版导入。
 
+## Vaultwarden / Bitwarden 同步
+
+- 支持 **PBKDF2-SHA256** 与 **Argon2id** 两种 KDF（Vaultwarden 新版默认 Argon2id），参数按账号从服务器 `prelogin` 读取；自签名证书自动跳过校验。
+- 登录成功后服务器地址、邮箱、账号密钥（userKey）等**随密码库一起加密保存**：关闭应用再打开，解锁密码库后仍是「已连接」，无需重新登录；点「断开连接」才会清除这份配置。
+- **同步到服务器**：本地全部条目都参与——未关联的新建、**已关联的按服务器 id 更新**。所以修改了账号/密码后再同步即可覆盖服务端记录，不会产生重复条目。
+- **拉取同步**：按服务器 cipher id 合并——已关联的就地更新（保留本地条目 id），内容完全相同的视为重复跳过，其余才新增。
+
 ## 功能状态
 
 | 功能 | 状态 |
@@ -109,7 +116,7 @@ npx tauri build --bundles nsis,msi      # 一次产出两种格式
 | 导入导出：加密备份 / 密阁 JSON / Vaultwarden JSON / CSV / otpauth | ✅ |
 | 自动锁定（窗口失焦超过阈值即锁定） | ✅ |
 | 界面语言切换（简体中文 / English，即时生效） | ✅ |
-| Vaultwarden 在线同步（登录 / 拉取 / 上传 / token 续期） | ✅ 代码完成，待真实服务器联调 |
+| Vaultwarden 在线同步（登录 / 拉取 / 同步上传 / token 续期 / Argon2id） | ✅ 已在真实服务器联调通过 |
 | 打开条目网址 | ✅ Windows / macOS / Linux |
 | Android 打开网址 | ⏳ 需改用 Intent（当前提示复制链接） |
 

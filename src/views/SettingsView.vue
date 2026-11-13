@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, ref, watch } from 'vue';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import { api, copyText, formatTime, type AppInfo, type BwStatus, type VaultData, type VaultItem } from '../api';
 import { lang, s, setLang } from '../i18n';
@@ -85,6 +85,18 @@ async function refreshBwStatus() {
   }
 }
 
+// 已连接时把服务器/邮箱回填到输入框，重启后不必重填（配置随密码库保存）
+watch(
+  bwStatus,
+  (status) => {
+    if (status) {
+      bwServer.value = status.server;
+      bwEmail.value = status.email;
+    }
+  },
+  { immediate: true }
+);
+
 async function bwConnect() {
   if (!bwEmail.value.trim() || !bwPassword.value) {
     setStatus(s.value.stBwNeedCreds, true);
@@ -123,7 +135,8 @@ async function bwPull() {
 }
 
 async function bwPush() {
-  const pending = props.items.filter((it) => !it.bwId);
+  // 全部条目都参与同步：没有 bwId 的新建，已关联的更新（本地修改才能推上去）
+  const pending = props.items;
   if (pending.length === 0) {
     setStatus(s.value.stBwNothingToPush, false);
     return;
@@ -138,6 +151,7 @@ async function bwPush() {
     setStatus(String(err), true);
   } finally {
     busy.value = false;
+    await refreshBwStatus();
   }
 }
 
