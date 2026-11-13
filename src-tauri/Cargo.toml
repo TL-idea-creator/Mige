@@ -1,6 +1,6 @@
 [package]
 name = "mige-win"
-version = "1.0.2"
+version = "1.0.3"
 description = "密阁 Windows 版：本地加密密码与验证码管理器"
 authors = ["李启海 <liqihai1987@foxmail.com>"]
 edition = "2021"

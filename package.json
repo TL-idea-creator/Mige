@@ -1,7 +1,7 @@
 {
   "name": "mige-win",
   "private": true,
-  "version": "1.0.2",
+  "version": "1.0.3",
   "type": "module",
   "description": "密阁 Windows 版（Tauri 2 + Vue 3），与鸿蒙版数据格式互通",
   "scripts": {
